@@ -1,0 +1,8 @@
+*.pyc
+*.log
+.env
+**/.vscode
+**/*.csv
+**/Notes
+**/__pycache*
+*.sublime*
