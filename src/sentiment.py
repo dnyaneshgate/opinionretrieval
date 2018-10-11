@@ -1,14 +1,17 @@
 import re
 import pickle
+import time
 from bs4 import BeautifulSoup
+from multiprocessing import Pool
 
 import pandas as pd
 import numpy as np
 import preprocessor as tweetpp
 
 from sklearn import model_selection, preprocessing, metrics
-from sklearn.naive_bayes import MultinomialNB
-from sklearn.linear_model  import LogisticRegression
+from sklearn.naive_bayes import MultinomialNB, BernoulliNB
+from sklearn.svm import LinearSVC
+from sklearn.linear_model import LogisticRegression
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from sklearn.pipeline import Pipeline
 
@@ -98,53 +101,6 @@ class TwitterDataset(object):
         return (' '.join(words)).strip()
 
 
-
-
-
-# dataset = TwitterDataset('dataset/trainingandtestdata/training.1600000.processed.noemoticon.csv', encoding='latin1', columns=['sentiment','id','date','flag','user','text'])
-# dataset.load()
-# dataset.drop_columns(['id', 'date', 'flag', 'user'])
-# dataset.cleanup()
-# dataset.save('dataset/trainingandtestdata/preprocessed_twitter_dataset.csv')
-
-
-# dataset = TwitterDataset('dataset/preprocessed_twitter_dataset.csv', columns=['sentiment', 'text'])
-# dataset.load()
-# dataset.drop_null_entries()
-
-
-# x_train, x_test, y_train, y_test = model_selection.train_test_split(dataset.df['text'], dataset.df['sentiment'])
-
-# encoder = preprocessing.LabelEncoder()
-# y_train = encoder.fit_transform(y_train)
-# y_test = encoder.fit_transform(y_test)
-
-# print('Extracting Features...')
-# tfidf_vec = TfidfVectorizer(analyzer='word', token_pattern=r'\w{1,}', encoding='utf-8', stop_words=stopwords.words('english'))
-# # tfidf_vec = TfidfVectorizer(encoding='utf-8', max_features=5000, stop_words=stopwords.words('english'))
-# tfidf_vec.fit(dataset.df['text'])
-
-# X_train = tfidf_vec.transform(x_train)
-# X_test = tfidf_vec.transform(x_test)
-
-# print('Training Multinomial Naive Bayes')
-# MNB_classifier = MultinomialNB()
-# MNB_classifier.fit( X_train, y_train )
-
-# print('Training Logistic Regression')
-# LR_classifier = LogisticRegression()
-# LR_classifier.fit( X_train, y_train )
-
-# predictions = MNB_classifier.predict(X_test)
-# accuracy = metrics.accuracy_score(predictions, y_test)
-# print('MNB Accuracy: ', accuracy)
-
-# predictions = LR_classifier.predict(X_test)
-# accuracy = metrics.accuracy_score(predictions, y_test)
-# print('LR Accuracy: ', accuracy)
-
-
-
 def prepare_pipeline(classifier, vectorizer, n_features, ngram_range=(1,1), stop_words=None, **kwargs):
     pipelines = []
     for n in n_features:
@@ -172,36 +128,107 @@ def plot(title, axis_label, data):
     plt.legend()
     plt.savefig("N-gram_accuracy.png")
 
-def main():
-    n_features = np.arange(10000, 100001, 10000)
-    lr_cvec_ug_pipeline = prepare_pipeline(LogisticRegression(), CountVectorizer, n_features)
-    lr_cvec_bg_pipeline = prepare_pipeline(LogisticRegression(), CountVectorizer, n_features, ngram_range=(1,2))
-    lr_cvec_tg_pipeline = prepare_pipeline(LogisticRegression(), CountVectorizer, n_features, ngram_range=(1,3))
+def extract_features(cvec, nfeatures, corpus, x_train, x_test):
+    print(cvec.__class__.__name__, ': ngram_range=', cvec.ngram_range, ',max_features:', nfeatures)
+    stime = time.time()
+    cvec.fit(corpus)
+    X_train = cvec.transform(x_train)
+    X_test  = cvec.transform(x_test)
+    print(cvec.__class__.__name__, ': ngram_range=', cvec.ngram_range, ',max_features:', nfeatures, 'Time taken: ', time.time() - stime)
+    return (nfeatures, X_train, X_test)
 
+def train_classifier(classifier, nfeatures, X_train, y_train, X_test, y_test):
+    stime = time.time()
+    try:
+        classifier.fit(X_train, y_train)
+        prediction = classifier.predict(X_test)
+        return (nfeatures, metrics.accuracy_score(prediction, y_test))
+    finally:
+        print('Time taken by classifier ', classifier.__class__.__name__, ' : ', time.time() - stime)
+
+def train(vectorizer):
+    start = time.time()
+    n_features = np.arange(10000, 100001, 10000)
+    print('nfeatures: ', n_features)
 
     dataset = TwitterDataset('dataset/preprocessed_twitter_dataset.csv', columns=['sentiment', 'text'])
     dataset.load()
     dataset.drop_null_entries()
+    corpus = dataset.df['text']
     x_train, x_test, y_train, y_test = model_selection.train_test_split(dataset.df['text'], dataset.df['sentiment'])
 
-    encoder = preprocessing.LabelEncoder()
-    y_train = encoder.fit_transform(y_train)
-    y_test = encoder.fit_transform(y_test)
+    stop_words = None
 
-    lr_cvec_ug = [ (n_feature, accuracy_summary(pipeline, x_train, y_train, x_test, y_test)) for (n_feature, pipeline) in lr_cvec_ug_pipeline ]
-    lr_cvec_bg = [ (n_feature, accuracy_summary(pipeline, x_train, y_train, x_test, y_test)) for (n_feature, pipeline) in lr_cvec_bg_pipeline ]
-    lr_cvec_tg = [ (n_feature, accuracy_summary(pipeline, x_train, y_train, x_test, y_test)) for (n_feature, pipeline) in lr_cvec_tg_pipeline ]
+    cvec_ug = []
+    cvec_bg = []
+    cvec_tg = []
 
-    lr_cvec_ug_plot = pd.DataFrame(lr_cvec_ug, columns=['nfeatures', 'accuracy'])
-    lr_cvec_bg_plot = pd.DataFrame(lr_cvec_bg, columns=['nfeatures', 'accuracy'])
-    lr_cvec_tg_plot = pd.DataFrame(lr_cvec_tg, columns=['nfeatures', 'accuracy'])
+    pool = Pool(processes=8)
 
-    graph = []
-    graph.append((lr_cvec_ug_plot.nfeatures, lr_cvec_ug_plot.accuracy, 'unigram count vectorizer'))
-    graph.append((lr_cvec_bg_plot.nfeatures, lr_cvec_bg_plot.accuracy, 'bigram count vectorizer'))
-    graph.append((lr_cvec_tg_plot.nfeatures, lr_cvec_tg_plot.accuracy, 'trigram count vectorizer'))
+    ug_result = []
+    bg_result = []
+    tg_result = []
+    for n in n_features:
+        ug_cvec = vectorizer(encoding='UTF-8', max_features=n, stop_words=stop_words)
+        ug_result.append( pool.apply_async(extract_features, (ug_cvec, n, corpus, x_train, x_test)) )
 
-    plot( "Test Result: Accuracy", ("N Features", "Accuracy"), graph )
+        bg_cvec = vectorizer(encoding='UTF-8', max_features=n, stop_words=stop_words, ngram_range=(1,2))
+        bg_result.append( pool.apply_async(extract_features, (bg_cvec, n, corpus, x_train, x_test)) )
+
+        tg_cvec = vectorizer(encoding='UTF-8', max_features=n, stop_words=stop_words, ngram_range=(1,3))
+        tg_result.append( pool.apply_async(extract_features, (tg_cvec, n, corpus, x_train, x_test)) )
+
+
+    for res in ug_result:
+        cvec_ug.append( res.get() )
+    for res in bg_result:
+        cvec_bg.append( res.get() )
+    for res in tg_result:
+        cvec_tg.append( res.get() )
+
+    classifiers = [
+                        LogisticRegression(),
+                        MultinomialNB(),
+                        BernoulliNB(),
+                        LinearSVC()
+                  ]
+
+
+
+    accuracy_map = {}
+    for classifier in classifiers:
+        print('Training classifier: ', classifier.__class__.__name__, ' , Unigram Feattures')
+        ug_result = [ pool.apply_async(train_classifier, (classifier, n, X_train, y_train, X_test, y_test)) for n, X_train, X_test in cvec_ug ]
+
+        print('Training classifier: ', classifier.__class__.__name__, ' , Bigram Feattures')
+        bg_result = [ pool.apply_async(train_classifier, (classifier, n, X_train, y_train, X_test, y_test)) for n, X_train, X_test in cvec_bg ]
+
+        print('Training classifier: ', classifier.__class__.__name__, ' , Trigram Feattures')
+        tg_result = [ pool.apply_async(train_classifier, (classifier, n, X_train, y_train, X_test, y_test)) for n, X_train, X_test in cvec_tg ]
+
+        accuracy_map['Unigram'] = [ res.get() for res in ug_result ]
+        accuracy_map['Bigram'] = [ res.get() for res in bg_result ]
+        accuracy_map['Trigram'] = [ res.get() for res in tg_result ]
+
+        plt.figure(figsize=(8, 6))
+        plt.title("%s - %s: Accuracy vs Feattures" % (classifier.__class__.__name__, vectorizer.__name__))
+        plt.xlabel("Accuracy")
+        plt.ylabel("Features")
+
+        for ngram, result in accuracy_map.items():
+            df = pd.DataFrame(result, columns=['nfeatures', 'accuracy'])
+            plt.plot(df.nfeatures, df.accuracy, label="%s %s" % (vectorizer.__name__, ngram))
+
+        plt.legend()
+        plt.savefig("%s - %s - N-gram.png" % (classifier.__class__.__name__, vectorizer.__name__))
+
+    print('Execution time: ', time.time() - start)
+
+
+
+def main():
+    train(CountVectorizer)
+    train(TfidfVectorizer)
 
 
 if __name__ == "__main__":
