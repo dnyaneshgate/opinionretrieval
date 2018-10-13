@@ -100,7 +100,6 @@ class TwitterDataset(object):
         words = [ x for x in self._word_tokenizer.tokenize(letters_only) if len(x) > 1 ]
         return (' '.join(words)).strip()
 
-
 def prepare_pipeline(classifier, vectorizer, n_features, ngram_range=(1,1), stop_words=None, **kwargs):
     pipelines = []
     for n in n_features:
@@ -128,11 +127,10 @@ def plot(title, axis_label, data):
     plt.legend()
     plt.savefig("N-gram_accuracy.png")
 
-def extract_features(cvec, nfeatures, corpus, x_train, x_test):
+def extract_features(cvec, nfeatures, x_train, x_test):
     print(cvec.__class__.__name__, ': ngram_range=', cvec.ngram_range, ',max_features:', nfeatures)
     stime = time.time()
-    cvec.fit(corpus)
-    X_train = cvec.transform(x_train)
+    X_train = cvec.fit_transform(x_train)
     X_test  = cvec.transform(x_test)
     print(cvec.__class__.__name__, ': ngram_range=', cvec.ngram_range, ',max_features:', nfeatures, 'Time taken: ', time.time() - stime)
     return (nfeatures, X_train, X_test)
@@ -142,7 +140,7 @@ def train_classifier(classifier, nfeatures, X_train, y_train, X_test, y_test):
     try:
         classifier.fit(X_train, y_train)
         prediction = classifier.predict(X_test)
-        return (nfeatures, metrics.accuracy_score(prediction, y_test))
+        return (nfeatures, metrics.accuracy_score(y_test, prediction))
     finally:
         print('Time taken by classifier ', classifier.__class__.__name__, ' : ', time.time() - stime)
 
@@ -154,7 +152,6 @@ def train(vectorizer):
     dataset = TwitterDataset('dataset/preprocessed_twitter_dataset.csv', columns=['sentiment', 'text'])
     dataset.load()
     dataset.drop_null_entries()
-    corpus = dataset.df['text']
     x_train, x_test, y_train, y_test = model_selection.train_test_split(dataset.df['text'], dataset.df['sentiment'])
 
     stop_words = None
@@ -170,13 +167,13 @@ def train(vectorizer):
     tg_result = []
     for n in n_features:
         ug_cvec = vectorizer(encoding='UTF-8', max_features=n, stop_words=stop_words)
-        ug_result.append( pool.apply_async(extract_features, (ug_cvec, n, corpus, x_train, x_test)) )
+        ug_result.append( pool.apply_async(extract_features, (ug_cvec, n, x_train, x_test)) )
 
         bg_cvec = vectorizer(encoding='UTF-8', max_features=n, stop_words=stop_words, ngram_range=(1,2))
-        bg_result.append( pool.apply_async(extract_features, (bg_cvec, n, corpus, x_train, x_test)) )
+        bg_result.append( pool.apply_async(extract_features, (bg_cvec, n, x_train, x_test)) )
 
         tg_cvec = vectorizer(encoding='UTF-8', max_features=n, stop_words=stop_words, ngram_range=(1,3))
-        tg_result.append( pool.apply_async(extract_features, (tg_cvec, n, corpus, x_train, x_test)) )
+        tg_result.append( pool.apply_async(extract_features, (tg_cvec, n, x_train, x_test)) )
 
 
     for res in ug_result:
