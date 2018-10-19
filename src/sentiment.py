@@ -3,6 +3,7 @@ import pickle
 import time
 from bs4 import BeautifulSoup
 from multiprocessing import Pool
+from collections import namedtuple
 
 import pandas as pd
 import numpy as np
@@ -13,6 +14,7 @@ from sklearn.naive_bayes import MultinomialNB, BernoulliNB
 from sklearn.svm import LinearSVC
 from sklearn.linear_model import LogisticRegression
 from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
+from sklearn.feature_selection import SelectKBest, chi2
 from sklearn.pipeline import Pipeline
 
 import matplotlib as mpl
@@ -21,6 +23,8 @@ import matplotlib.pyplot as plt
 
 from nltk.corpus import stopwords
 from nltk.tokenize import WordPunctTokenizer
+from nltk.stem.snowball import SnowballStemmer
+from nltk.stem import WordNetLemmatizer
 
 
 def preprocess_tweet(tweet):
@@ -54,6 +58,44 @@ url_pat = r'https?://[^ ]+'
 www_pat = r'www.[^ ]+'
 neg_pat = re.compile(r'\b(' + '|'.join(negative_contractions.keys()) + r')\b')
 
+
+def decode_utf(text):
+    try:
+        return text.decode('utf-8-sig').replace(u'\ufffd', '?')
+    except:
+        return text
+
+def tweet_cleanup(tweet):
+    cleanup_func = [
+                        # HTML decoding
+                        lambda text: BeautifulSoup(text, 'lxml').get_text(),
+
+                        # Unicode decoding
+                        lambda text: decode_utf(text),
+
+                        # Removed mentions
+                        lambda text: re.sub(mentions_pat, '', text),
+
+                        # Removed URL
+                        lambda text: re.sub(url_pat, '', text),
+
+                        # Removed URL
+                        lambda text: re.sub(www_pat, '', text),
+
+                        lambda text: text.lower(),
+
+                        # Remove negative contractions
+                        lambda text: neg_pat.sub(lambda x: negative_contractions[x.group()], text),
+
+                        # Letters only
+                        lambda text: re.sub('[^a-zA-Z]', ' ', text)
+
+                        # Remove white spaces
+                        lambda text: ' '.join([x for x in tokenizer.tokenize(text) if len(x) > 1])
+                   ]
+    for func in cleanup_func:
+        tweet = func(tweet)
+    return tweet
 
 class TwitterDataset(object):
     def __init__(self, filename, encoding='utf-8', columns=None):
@@ -99,33 +141,6 @@ class TwitterDataset(object):
         letters_only = re.sub('[^a-zA-Z]', ' ', neg_handled)
         words = [ x for x in self._word_tokenizer.tokenize(letters_only) if len(x) > 1 ]
         return (' '.join(words)).strip()
-
-def prepare_pipeline(classifier, vectorizer, n_features, ngram_range=(1,1), stop_words=None, **kwargs):
-    pipelines = []
-    for n in n_features:
-        vec = vectorizer()
-        vec.set_params(stop_words=stop_words, max_features=n, ngram_range=ngram_range, **kwargs)
-        pipeline = Pipeline( [
-                    ('vectorizer', vec),
-                    ('classifier', classifier)
-                ] )
-        pipelines.append((n, pipeline))
-    return pipelines
-
-def accuracy_summary(pipline, x_train, y_train, x_test, y_test):
-    pipline.fit(x_train, y_train)
-    prediction = pipline.predict(x_test)
-    return metrics.accuracy_score(prediction, y_test)
-
-def plot(title, axis_label, data):
-    plt.figure(figsize=(8,6))
-    for row in data:
-        plt.plot(row[0], row[1], label=row[2])
-    plt.title(title)
-    plt.xlabel(axis_label[0])
-    plt.ylabel(axis_label[1])
-    plt.legend()
-    plt.savefig("N-gram_accuracy.png")
 
 def extract_features(cvec, nfeatures, x_train, x_test):
     print(cvec.__class__.__name__, ': ngram_range=', cvec.ngram_range, ',max_features:', nfeatures)
@@ -223,9 +238,71 @@ def train(vectorizer):
 
 
 
+class Estimator(object):
+    def __init__(self, clf, vect, pipeline = None):
+        self._clf = clf
+        self._vect = vect
+        self._pipeline = pipeline
+
+    @classmethod
+    def load_from_file(cls, filepath):
+        with open(filepath, 'rb') as f:
+            pipeline = pickle.load(f)
+            return cls(None, None, pipeline)
+
+
+    def fit_save(self, x_train, y_train, filepath):
+        self._pipeline = Pipeline([ ('vect', self._vect), ('clf', self._clf) ])
+        self._pipeline.fit(x_train, y_train)
+        with open(filepath, 'wb') as f:
+            pickle.dump(self._pipeline, f)
+
+    def predict(self, x_test):
+        return self._pipeline.predict(x_test)
+
+
+def main1():
+    # train(CountVectorizer)
+    # train(TfidfVectorizer)
+
+    stime = time.time()
+    try:
+        stop_words = [ "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but", "by", "could", "did", "do", "does", "doing", "down", "during", "each", "few", "for", "from", "further", "had", "has", "have", "having", "he", "he'd", "he'll", "he's", "her", "here", "here's", "hers", "herself", "him", "himself", "his", "how", "how's", "i", "i'd", "i'll", "i'm", "i've", "if", "in", "into", "is", "it", "it's", "its", "itself", "let's", "me", "more", "most", "my", "myself", "nor", "of", "on", "once", "only", "or", "other", "ought", "our", "ours", "ourselves", "out", "over", "own", "same", "she", "she'd", "she'll", "she's", "should", "so", "some", "such", "than", "that", "that's", "the", "their", "theirs", "them", "themselves", "then", "there", "there's", "these", "they", "they'd", "they'll", "they're", "they've", "this", "those", "through", "to", "too", "under", "until", "up", "very", "was", "we", "we'd", "we'll", "we're", "we've", "were", "what", "what's", "when", "when's", "where", "where's", "which", "while", "who", "who's", "whom", "why", "why's", "with", "would", "you", "you'd", "you'll", "you're", "you've", "your", "yours", "yourself", "yourselves" ]
+ #stopwords.words('english')
+        stemmer = SnowballStemmer('english')
+        lemmer=WordNetLemmatizer()
+
+        transformer_func = [
+                                lambda text: ' '.join([word for word in text.split() if word not in stop_words]),
+                                lambda text: ' '.join([stemmer.stem(word) for word in text.split()]),
+                                lambda text: ' '.join([lemmer.lemmatize(word) for word in text.split()])
+                           ]
+
+        dataset = TwitterDataset('dataset/preprocessed_twitter_dataset.csv', columns=['sentiment', 'text'])
+        dataset.load()
+        dataset.drop_null_entries()
+
+        # for func in transformer_func:
+        #     dataset.df['text'] = dataset.df['text'].apply(func)
+        #     print(dataset.df.text.head(5))
+
+        x_train, x_test, y_train, y_test = model_selection.train_test_split(dataset.df['text'], dataset.df['sentiment'])
+
+        vect = TfidfVectorizer(stop_words=None, max_features=100000, ngram_range=(1,3))
+        clf = LogisticRegression()
+
+        X_train = vect.fit_transform(x_train)
+        X_test = vect.transform(x_test)
+
+        clf.fit(X_train, y_train)
+        y_pred = clf.predict(X_test)
+        print('Accuracy: ', metrics.accuracy_score(y_test, y_pred))
+
+    finally:
+        print('Time Taken By Application: {}'.format(time.time() - stime))
+
 def main():
-    train(CountVectorizer)
-    train(TfidfVectorizer)
+
 
 
 if __name__ == "__main__":
