@@ -1,6 +1,7 @@
 *.pyc
 *.log
 .env
+*.pickle
 **/.vscode
 **/*.csv
 **/Notes

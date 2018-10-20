@@ -1,25 +1,18 @@
+import os
 import re
 import pickle
 import time
+import logging
 from bs4 import BeautifulSoup
-from multiprocessing import Pool
-from collections import namedtuple
 
 import pandas as pd
 import numpy as np
-import preprocessor as tweetpp
 
 from sklearn import model_selection, preprocessing, metrics
-from sklearn.naive_bayes import MultinomialNB, BernoulliNB
-from sklearn.svm import LinearSVC
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
-from sklearn.feature_selection import SelectKBest, chi2
-from sklearn.pipeline import Pipeline
-
-import matplotlib as mpl
-mpl.use('Agg')
-import matplotlib.pyplot as plt
+from sklearn.ensemble import VotingClassifier
+from sklearn.pipeline import Pipeline, FeatureUnion
 
 from nltk.corpus import stopwords
 from nltk.tokenize import WordPunctTokenizer
@@ -27,10 +20,7 @@ from nltk.stem.snowball import SnowballStemmer
 from nltk.stem import WordNetLemmatizer
 
 
-def preprocess_tweet(tweet):
-    tweet = tweet.lower()
-    tweet = tweetpp.clean(tweet)
-    return tweet
+log = logging.getLogger()
 
 negative_contractions = {
     "can't": "can not",
@@ -58,6 +48,9 @@ url_pat = r'https?://[^ ]+'
 www_pat = r'www.[^ ]+'
 neg_pat = re.compile(r'\b(' + '|'.join(negative_contractions.keys()) + r')\b')
 
+tokenizer = WordPunctTokenizer()
+stemmer = SnowballStemmer('english')
+lemmer=WordNetLemmatizer()
 
 def decode_utf(text):
     try:
@@ -82,20 +75,38 @@ def tweet_cleanup(tweet):
                         # Removed URL
                         lambda text: re.sub(www_pat, '', text),
 
+                        # Convert to lower case
                         lambda text: text.lower(),
 
                         # Remove negative contractions
                         lambda text: neg_pat.sub(lambda x: negative_contractions[x.group()], text),
 
                         # Letters only
-                        lambda text: re.sub('[^a-zA-Z]', ' ', text)
+                        lambda text: re.sub('[^a-zA-Z]', ' ', text),
 
                         # Remove white spaces
-                        lambda text: ' '.join([x for x in tokenizer.tokenize(text) if len(x) > 1])
+                        lambda text: ' '.join([x for x in tokenizer.tokenize(text) if len(x) > 1]),
+
+                        # # remove stop words
+                        # lambda text: ' '.join([word for word in text.split() if word not in stop_words]),
+
+                        # # apply stemmer
+                        # lambda text: ' '.join([stemmer.stem(word) for word in text.split()]),
+
+                        # #apply lemmatization
+                        # lambda text: ' '.join([lemmer.lemmatize(word) for word in text.split()])
                    ]
     for func in cleanup_func:
         tweet = func(tweet)
     return tweet
+
+def load_class(filepath):
+    with open(filepath, 'rb') as f:
+        return pickle.load(f)
+
+def dump_class(class_, filepath):
+    with open(filepath, 'wb') as f:
+        pickle.dump(class_, f)
 
 class TwitterDataset(object):
     def __init__(self, filename, encoding='utf-8', columns=None):
@@ -106,213 +117,173 @@ class TwitterDataset(object):
         self.df = None
 
     def load(self):
-        print('Loading dataset...')
+        log.info('Loading dataset...')
         self.df = pd.read_csv(self._filename, encoding=self._encoding, names=self._columns)
 
     def drop_columns(self, columns):
-        print('Dropping cloumns: ', columns)
+        log.info('Dropping cloumns: %s', columns)
         self.df = self.df.drop(columns, axis=1)
 
     def drop_null_entries(self):
-        print('Drop NULL entries...')
+        log.info('Drop NULL entries...')
         self.df.dropna(inplace=True)
         self.df.reset_index(drop=True, inplace=True)
 
     def save(self, filepath, encoding='utf-8'):
-        print('Saving dataset to file ', filepath)
+        log.info('Saving dataset to file %s', filepath)
         self.df.to_csv(filepath, encoding=encoding, index=False, header=False)
 
     def cleanup(self):
-        print('Dataset preprocessing')
-        self.df['text'] = self.df['text'].apply(self._preprocess_tweets)
-
-    def _preprocess_tweets(self, tweet):
-        soup = BeautifulSoup(tweet, 'lxml')
-        souped = soup.get_text()
-        try:
-            bom_removed = souped.decode('utf-8-sig').replace(u'\ufffd', '?')
-        except Exception:
-            bom_removed = souped
-        stripped = re.sub(mentions_pat, '', bom_removed)
-        stripped = re.sub(url_pat, '', stripped)
-        stripped = re.sub(www_pat, '', stripped)
-        lower_case = stripped.lower()
-        neg_handled = neg_pat.sub(lambda x: negative_contractions[x.group()], lower_case)
-        letters_only = re.sub('[^a-zA-Z]', ' ', neg_handled)
-        words = [ x for x in self._word_tokenizer.tokenize(letters_only) if len(x) > 1 ]
-        return (' '.join(words)).strip()
-
-def extract_features(cvec, nfeatures, x_train, x_test):
-    print(cvec.__class__.__name__, ': ngram_range=', cvec.ngram_range, ',max_features:', nfeatures)
-    stime = time.time()
-    X_train = cvec.fit_transform(x_train)
-    X_test  = cvec.transform(x_test)
-    print(cvec.__class__.__name__, ': ngram_range=', cvec.ngram_range, ',max_features:', nfeatures, 'Time taken: ', time.time() - stime)
-    return (nfeatures, X_train, X_test)
-
-def train_classifier(classifier, nfeatures, X_train, y_train, X_test, y_test):
-    stime = time.time()
-    try:
-        classifier.fit(X_train, y_train)
-        prediction = classifier.predict(X_test)
-        return (nfeatures, metrics.accuracy_score(y_test, prediction))
-    finally:
-        print('Time taken by classifier ', classifier.__class__.__name__, ' : ', time.time() - stime)
-
-def train(vectorizer):
-    start = time.time()
-    n_features = np.arange(10000, 100001, 10000)
-    print('nfeatures: ', n_features)
-
-    dataset = TwitterDataset('dataset/preprocessed_twitter_dataset.csv', columns=['sentiment', 'text'])
-    dataset.load()
-    dataset.drop_null_entries()
-    x_train, x_test, y_train, y_test = model_selection.train_test_split(dataset.df['text'], dataset.df['sentiment'])
-
-    stop_words = None
-
-    cvec_ug = []
-    cvec_bg = []
-    cvec_tg = []
-
-    pool = Pool(processes=8)
-
-    ug_result = []
-    bg_result = []
-    tg_result = []
-    for n in n_features:
-        ug_cvec = vectorizer(encoding='UTF-8', max_features=n, stop_words=stop_words)
-        ug_result.append( pool.apply_async(extract_features, (ug_cvec, n, x_train, x_test)) )
-
-        bg_cvec = vectorizer(encoding='UTF-8', max_features=n, stop_words=stop_words, ngram_range=(1,2))
-        bg_result.append( pool.apply_async(extract_features, (bg_cvec, n, x_train, x_test)) )
-
-        tg_cvec = vectorizer(encoding='UTF-8', max_features=n, stop_words=stop_words, ngram_range=(1,3))
-        tg_result.append( pool.apply_async(extract_features, (tg_cvec, n, x_train, x_test)) )
-
-
-    for res in ug_result:
-        cvec_ug.append( res.get() )
-    for res in bg_result:
-        cvec_bg.append( res.get() )
-    for res in tg_result:
-        cvec_tg.append( res.get() )
-
-    classifiers = [
-                        LogisticRegression(),
-                        MultinomialNB(),
-                        BernoulliNB(),
-                        LinearSVC()
-                  ]
-
-
-
-    accuracy_map = {}
-    for classifier in classifiers:
-        print('Training classifier: ', classifier.__class__.__name__, ' , Unigram Feattures')
-        ug_result = [ pool.apply_async(train_classifier, (classifier, n, X_train, y_train, X_test, y_test)) for n, X_train, X_test in cvec_ug ]
-
-        print('Training classifier: ', classifier.__class__.__name__, ' , Bigram Feattures')
-        bg_result = [ pool.apply_async(train_classifier, (classifier, n, X_train, y_train, X_test, y_test)) for n, X_train, X_test in cvec_bg ]
-
-        print('Training classifier: ', classifier.__class__.__name__, ' , Trigram Feattures')
-        tg_result = [ pool.apply_async(train_classifier, (classifier, n, X_train, y_train, X_test, y_test)) for n, X_train, X_test in cvec_tg ]
-
-        accuracy_map['Unigram'] = [ res.get() for res in ug_result ]
-        accuracy_map['Bigram'] = [ res.get() for res in bg_result ]
-        accuracy_map['Trigram'] = [ res.get() for res in tg_result ]
-
-        plt.figure(figsize=(8, 6))
-        plt.title("%s - %s: Accuracy vs Feattures" % (classifier.__class__.__name__, vectorizer.__name__))
-        plt.xlabel("Accuracy")
-        plt.ylabel("Features")
-
-        for ngram, result in accuracy_map.items():
-            df = pd.DataFrame(result, columns=['nfeatures', 'accuracy'])
-            plt.plot(df.nfeatures, df.accuracy, label="%s %s" % (vectorizer.__name__, ngram))
-
-        plt.legend()
-        plt.savefig("%s - %s - N-gram.png" % (classifier.__class__.__name__, vectorizer.__name__))
-
-    print('Execution time: ', time.time() - start)
-
-
+        log.info('Dataset preprocessing')
+        self.df['text'] = self.df['text'].apply(tweet_cleanup)
 
 class Estimator(object):
-    def __init__(self, clf, vect, pipeline = None):
-        self._clf = clf
-        self._vect = vect
+    def __init__(self, model_name, classifier=None, feature_extractor=None, pipeline=None):
+        self._classifier = classifier
+        self._feature_extractor = feature_extractor
         self._pipeline = pipeline
+        self._model_name = model_name
 
     @classmethod
-    def load_from_file(cls, filepath):
+    def load_from_file(cls, clf_name, filepath):
+        log.info('Loading pipeline from file %s', filepath)
         with open(filepath, 'rb') as f:
-            pipeline = pickle.load(f)
-            return cls(None, None, pipeline)
+            return cls(clf_name, pipeline=pickle.load(f))
 
-
-    def fit_save(self, x_train, y_train, filepath):
-        self._pipeline = Pipeline([ ('vect', self._vect), ('clf', self._clf) ])
-        self._pipeline.fit(x_train, y_train)
+    def save(self, filepath):
+        log.info('Saving pipeline to file %s', filepath)
         with open(filepath, 'wb') as f:
             pickle.dump(self._pipeline, f)
+
+    @property
+    def pipeline(self):
+        return self._pipeline
+
+    def fit(self, x_train, y_train):
+        log.info('[%s] Training model...', self._model_name)
+        self._pipeline = Pipeline(
+            [
+                ('transformer', self._feature_extractor),
+                ('classifier', self._classifier)
+            ]
+        )
+        self._pipeline.fit(x_train, y_train)
 
     def predict(self, x_test):
         return self._pipeline.predict(x_test)
 
+class EstimatorPipeline(object):
+    def ___init__(self):
+        self._estimators = []
 
-def main1():
-    # train(CountVectorizer)
-    # train(TfidfVectorizer)
+    def add(self, step, estimator):
+        self._estimators.append((step, estimator))
 
-    stime = time.time()
-    try:
-        stop_words = [ "a", "about", "above", "after", "again", "against", "all", "am", "an", "and", "any", "are", "as", "at", "be", "because", "been", "before", "being", "below", "between", "both", "but", "by", "could", "did", "do", "does", "doing", "down", "during", "each", "few", "for", "from", "further", "had", "has", "have", "having", "he", "he'd", "he'll", "he's", "her", "here", "here's", "hers", "herself", "him", "himself", "his", "how", "how's", "i", "i'd", "i'll", "i'm", "i've", "if", "in", "into", "is", "it", "it's", "its", "itself", "let's", "me", "more", "most", "my", "myself", "nor", "of", "on", "once", "only", "or", "other", "ought", "our", "ours", "ourselves", "out", "over", "own", "same", "she", "she'd", "she'll", "she's", "should", "so", "some", "such", "than", "that", "that's", "the", "their", "theirs", "them", "themselves", "then", "there", "there's", "these", "they", "they'd", "they'll", "they're", "they've", "this", "those", "through", "to", "too", "under", "until", "up", "very", "was", "we", "we'd", "we'll", "we're", "we've", "were", "what", "what's", "when", "when's", "where", "where's", "which", "while", "who", "who's", "whom", "why", "why's", "with", "would", "you", "you'd", "you'll", "you're", "you've", "your", "yours", "yourself", "yourselves" ]
- #stopwords.words('english')
-        stemmer = SnowballStemmer('english')
-        lemmer=WordNetLemmatizer()
+class Sentiment(object):
+    SENTIMENT_POSITIVE = 4
+    SENTIMENT_NEGATIVE = 0
+    SENTIMENT_MAP = {
+        SENTIMENT_POSITIVE: 'Positive :-)',
+        SENTIMENT_NEGATIVE: 'Negative :-('
+    }
+    def __init__(self):
+        self._models = {
+            'LogisticRegression': {
+                'classifier': LogisticRegression(),
+                'transformer': TfidfVectorizer(max_features=100000, ngram_range=(1,3), stop_words=None),
+                'file': 'logistic_regression.pickle'
+            }
+        }
+        self._estimators = []
+        self._classifier = None
 
-        transformer_func = [
-                                lambda text: ' '.join([word for word in text.split() if word not in stop_words]),
-                                lambda text: ' '.join([stemmer.stem(word) for word in text.split()]),
-                                lambda text: ' '.join([lemmer.lemmatize(word) for word in text.split()])
-                           ]
+    def _train(self, force=False):
+        log.info('Sentiment: _train()')
+        training_dataset = TwitterDataset('dataset/training.1600000.processed.noemoticon.csv', columns=['sentiment', 'text'])
+        training_dataset.load()
+        testing_dataset = TwitterDataset('dataset/testdata.manual.2009.06.14.csv', columns=['sentiment', 'text'])
+        testing_dataset.load()
 
-        dataset = TwitterDataset('dataset/preprocessed_twitter_dataset.csv', columns=['sentiment', 'text'])
-        dataset.load()
-        dataset.drop_null_entries()
+        log.info(training_dataset.df)
 
-        # for func in transformer_func:
-        #     dataset.df['text'] = dataset.df['text'].apply(func)
-        #     print(dataset.df.text.head(5))
+        x_train, y_train = training_dataset.df.text.values.astype('U'), training_dataset.df.sentiment
+        x_test, y_test = testing_dataset.df.text.values.astype('U'), testing_dataset.df.sentiment
+        # for clf_name, params in self._models.items():
+        #     if os.path.exists(params['file']) and not force:
+        #         continue
+        #     classifier = params['classifier']
+        #     estimator = Estimator(clf_name, classifier=classifier, feature_extractor=params['transformer'])
+        #     # estimator.fit(x_train, y_train)
+        #     # estimator.save(params['file'])
+        #     self._estimators.append((clf_name, estimator))
 
-        x_train, x_test, y_train, y_test = model_selection.train_test_split(dataset.df['text'], dataset.df['sentiment'])
+        feature_union = FeatureUnion(
+            [
+                ('tfidf', TfidfVectorizer(max_features=100000, ngram_range=(1,3), stop_words=None)),
+            ]
+        )
 
-        vect = TfidfVectorizer(stop_words=None, max_features=100000, ngram_range=(1,3))
-        clf = LogisticRegression()
+        estimators = [
+            ('pipe1', LogisticRegression()),
+        ]
 
-        X_train = vect.fit_transform(x_train)
-        X_test = vect.transform(x_test)
+        pipeline = Pipeline(
+            [
+                ('features', feature_union),
+                ('classifier', VotingClassifier(estimators=estimators))
+            ]
+        )
+        pipeline.fit(x_train, y_train)
+        log.info('score: %s', pipeline.score(x_test, y_test))
 
-        clf.fit(X_train, y_train)
-        y_pred = clf.predict(X_test)
-        print('Accuracy: ', metrics.accuracy_score(y_test, y_pred))
+        self._classifier = pipeline
 
-    finally:
-        print('Time Taken By Application: {}'.format(time.time() - stime))
+        dump_class(pipeline, 'voting_classifier.pickle')
 
-def main():
-
-
-
-if __name__ == "__main__":
-    # import logger
-    # log = logger.init_logger()
-    main()
-
-
-
+    def prepare(self):
+        log.info('Sentiment: prepare()')
+        # for clf_name, params in self._models.items():
+        #     if not os.path.exists(params['file']):
+        #         self._train()
+        #     estimator = Estimator.load_from_file(clf_name, params['file'])
+        #     self._estimators.append((clf_name, estimator))
+        filepath = 'voting_classifier.pickle'
+        if os.path.exists(filepath):
+            self._classifier = load_class(filepath)
+        else:
+            self._train()
 
 
+    def get_sentiment(self, text):
+        log.info('Sentiment: get_sentiment()')
+        if not isinstance(text, list):
+            text = [text]
+        x_pred = pd.DataFrame(text, columns=['text'])
+        x_pred['text'] = x_pred['text'].apply(tweet_cleanup)
+        sentiment = self._classifier.predict(x_pred['text'])
+        return sentiment
 
+if __name__ == '__main__':
+    console = logging.StreamHandler()
+    log.addHandler(console)
+    log.setLevel(logging.DEBUG)
 
+    # cols = ['sentiment','id','date','query_string','user','text']
+    # dataset = TwitterDataset('dataset/trainingandtestdata/testdata.manual.2009.06.14.csv', columns=cols, encoding='latin1')
+    # dataset.load()
+    # dataset.drop_columns(['id','date','query_string','user'])
+    # dataset.cleanup()
+    # dataset.drop_null_entries()
+    # dataset.df = dataset.df[dataset.df.sentiment != 2]
+    # log.info(dataset.df)
+    # dataset.save('dataset/testdata.manual.2009.06.14.csv')
+
+    analyzer = Sentiment()
+    analyzer.prepare()
+    data = [
+        'This is a great movie',
+        'worst movie evet watched'
+    ]
+    log.info('sentiment: %s', analyzer.get_sentiment(data))
+    # log.info('sentiment: %s', analyzer.get_sentiment('this is very good movie'))
+    # log.info('sentiment: %s', analyzer.get_sentiment('this is very bad movie'))
