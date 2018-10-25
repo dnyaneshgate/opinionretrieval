@@ -208,14 +208,6 @@ class Sentiment(object):
 
         x_train, y_train = training_dataset.df.text.values.astype('U'), training_dataset.df.sentiment
         x_test, y_test = testing_dataset.df.text.values.astype('U'), testing_dataset.df.sentiment
-        # for clf_name, params in self._models.items():
-        #     if os.path.exists(params['file']) and not force:
-        #         continue
-        #     classifier = params['classifier']
-        #     estimator = Estimator(clf_name, classifier=classifier, feature_extractor=params['transformer'])
-        #     # estimator.fit(x_train, y_train)
-        #     # estimator.save(params['file'])
-        #     self._estimators.append((clf_name, estimator))
 
         feature_union = FeatureUnion(
             [
