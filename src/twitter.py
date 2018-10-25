@@ -1,4 +1,5 @@
 import logging
+import threading
 from datetime import datetime, timedelta
 from abc import ABCMeta, abstractmethod
 import jsonpickle
@@ -83,12 +84,12 @@ class Twitter(IPlatform):
 
     def connect(self):
         log.info('Twitter::connect()')
-        # self._auth = tweepy.AppAuthHandler(TWITTER_API_KEY, TWITTER_API_SECRET)
-        self._auth = tweepy.OAuthHandler(self._auth_params['TWITTER_API_KEY'], self._auth_params['TWITTER_API_SECRET'])
-        self._auth.set_access_token(self._auth_params['TWITTER_ACCESS_TOKEN'], self._auth_params['TWITTER_ACCESS_TOKEN_SECRET'])
+        self._auth = tweepy.AppAuthHandler(self._auth_params['TWITTER_API_KEY'], self._auth_params['TWITTER_API_SECRET'])
+        # self._auth = tweepy.OAuthHandler(self._auth_params['TWITTER_API_KEY'], self._auth_params['TWITTER_API_SECRET'])
+        # self._auth.set_access_token(self._auth_params['TWITTER_ACCESS_TOKEN'], self._auth_params['TWITTER_ACCESS_TOKEN_SECRET'])
         self._api = tweepy.API(self._auth, wait_on_rate_limit=True, wait_on_rate_limit_notify=True)
 
-    def search(self, text: str, timeframe: int = TimeFrame.DAY, near: str = 'India', max_tweets: int = 100, since_id: int = None, max_id: int = -1) -> list:
+    def search(self, text: str, timeframe: int = TimeFrame.DAY, near: str = 'India', max_tweets: int = 100, since_id: int = None, max_id: int = -1, callback = None) -> list:
         log.info('Twitter::search()')
         result = []
 
@@ -114,8 +115,16 @@ class Twitter(IPlatform):
                     break
 
                 for tweet in tweets:
-                    # result.append( jsonpickle.encode(tweet._json, unpicklable=False) )
-                    result.append( self._process_tweet(tweet._json) )
+                    try:
+                        processed_tweet = self._process_tweet(tweet._json)
+                        if callback:
+                            callback(processed_tweet)
+                        else:
+                            result.append( processed_tweet )
+                    except Exception as e:
+                        log.error('search(): tweet: %s', tweet)
+                        log.error('search(): exception: %s', str(e))
+                        log.traceback(e)
 
                 tweet_count += len(tweets)
                 max_id = tweets[-1].id
@@ -129,22 +138,25 @@ class Twitter(IPlatform):
         loc = self._get_loc(tweet)
         return (text, loc)
 
-    def _get_text(self, tweet):
-        if "retweeted_status" in tweet:
+    def _get_text(self, tweet_dict):
+        try:
+            tweet = tweet_dict
+            if "retweeted_status" in tweet_dict:
+                tweet = tweet_dict['retweeted_status']
+
+            if 'extended_tweet' in tweet:
+                tweet = tweet['extended_tweet']
+
             try:
-                text = tweet['retweeted_status']['extended_tweet']['full_text']
-            except:
-                text = tweet['retweeted_status']['text']
-        else:
-            try:
-                text = tweet['extended_tweet']['full_text']
+                text = tweet['full_text']
             except:
                 text = tweet['text']
-
-        return self._filter_text(text)
-
-    def _filter_text(self, text):
-        return preprocessor.clean(text)
+        except Exception as e:
+            log.debug('Tweet: %s', pp.pformat(tweet, indent=2, width=1))
+            log.error('_get_text() exception: %s', str(e))
+            log.traceback(e)
+            raise
+        return text
 
     def _get_loc(self, tweet):
         if tweet['coordinates']:
@@ -165,10 +177,20 @@ class TwitterStream(Twitter):
         self.__queue = Queue()
         self.__tracks = []
         self.__langs = ['en']
+        self.__thread = None
+
+    def connect(self):
+        log.info('Twitter::connect()')
+        self._auth = tweepy.OAuthHandler(self._auth_params['TWITTER_API_KEY'], self._auth_params['TWITTER_API_SECRET'])
+        self._auth.set_access_token(self._auth_params['TWITTER_ACCESS_TOKEN'], self._auth_params['TWITTER_ACCESS_TOKEN_SECRET'])
+        self._api = tweepy.API(self._auth, wait_on_rate_limit=True, wait_on_rate_limit_notify=True)
 
     def add_filter(self, *track):
         log.info('TwitterStream::add_filter()')
         self.__tracks.extend(list(track))
+
+    def register_callback(self, callback):
+        self._callback = callback
 
     def _process_tweet(self, tweet):
         result = super(TwitterStream, self)._process_tweet(tweet)
@@ -180,22 +202,24 @@ class TwitterStream(Twitter):
         #     log.info("orig_tweet: %s", orig_tweet._json)
         return result
 
-    def start(self):
-        log.info('TwitterStream::start()')
-        listener = TweetListener(self.__queue, self.__tweet_limit, api=self._api)
-        stream = Stream(auth=self._auth, listener=listener, tweet_mode='extended')
-        stream.filter(track=self.__tracks, languages=self.__langs, async=True)
+    def _consume_tweets(self):
         while True:
             tweet = self.__queue.get()
             self.__queue.task_done()
             if not tweet:
                 break
             tweet = json.loads(tweet)
-            (text, loc) = self._process_tweet(tweet)
-            log.info("-------------------------------------------------------------------")
-            # log.info("TWEET: %s\n\n", pp.pformat(json.loads(tweet), indent=2, width=1))
-            log.info("TEXT: %s", text)
-            log.info("LOC: %s", loc)
+            tweet = self._process_tweet(tweet)
+            self._callback(tweet)
+
+    def start(self):
+        log.info('TwitterStream::start()')
+        listener = TweetListener(self.__queue, self.__tweet_limit, api=self._api)
+        stream = Stream(auth=self._auth, listener=listener, tweet_mode='extended')
+        stream.filter(track=self.__tracks, languages=self.__langs, async=True)
+        self.__thread = threading.Thread(target=self._consume_tweets)
+        self.__thread.start()
+        self.__thread.join()
 
 __all__ = [ 'Twitter', 'TwitterStream' ]
 
