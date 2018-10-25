@@ -6,19 +6,22 @@ import logging
 from bs4 import BeautifulSoup
 
 import pandas as pd
-import numpy as np
+# import numpy as np
 
 from sklearn import model_selection, preprocessing, metrics
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
+from sklearn.naive_bayes import MultinomialNB, BernoulliNB
+from sklearn.svm import LinearSVC
 from sklearn.ensemble import VotingClassifier
 from sklearn.pipeline import Pipeline, FeatureUnion
 
+import nltk
 from nltk.corpus import stopwords
 from nltk.tokenize import WordPunctTokenizer
 from nltk.stem.snowball import SnowballStemmer
 from nltk.stem import WordNetLemmatizer
-
+from nltk.corpus import wordnet
 
 log = logging.getLogger()
 
@@ -43,6 +46,13 @@ negative_contractions = {
     "needn't": "need not",
 }
 
+wordnet_pos = {
+    'J': wordnet.ADJ,
+    'V': wordnet.VERB,
+    'N': wordnet.NOUN,
+    'R': wordnet.ADV,
+}
+
 mentions_pat = r'@[A-Za-z0-9_]+'
 url_pat = r'https?://[^ ]+'
 www_pat = r'www.[^ ]+'
@@ -57,6 +67,11 @@ def decode_utf(text):
         return text.decode('utf-8-sig').replace(u'\ufffd', '?')
     except:
         return text
+
+def lemmatize(text):
+    word_pos = nltk.pos_tag(nltk.word_tokenize(text))
+    lemm_words = [ lemmer.lemmatize( w[0], wordnet_pos.get(w[1], wordnet.NOUN)) for w in word_pos ]
+    return ' '.join(lemm_words)
 
 def tweet_cleanup(tweet):
     cleanup_func = [
@@ -90,11 +105,13 @@ def tweet_cleanup(tweet):
                         # # remove stop words
                         # lambda text: ' '.join([word for word in text.split() if word not in stop_words]),
 
-                        # # apply stemmer
-                        # lambda text: ' '.join([stemmer.stem(word) for word in text.split()]),
+                        # apply stemmer
+                        lambda text: ' '.join([stemmer.stem(word) for word in text.split()]),
 
-                        # #apply lemmatization
-                        # lambda text: ' '.join([lemmer.lemmatize(word) for word in text.split()])
+                        # apply lemmatization
+                        lambda text: lemmatize(text),
+
+                        lambda text: str(text),
                    ]
     for func in cleanup_func:
         tweet = func(tweet)
@@ -186,6 +203,7 @@ class Sentiment(object):
         SENTIMENT_POSITIVE: 'Positive :-)',
         SENTIMENT_NEGATIVE: 'Negative :-('
     }
+
     def __init__(self):
         self._models = {
             'LogisticRegression': {
@@ -197,14 +215,9 @@ class Sentiment(object):
         self._estimators = []
         self._classifier = None
 
-    def _train(self, force=False):
-        log.info('Sentiment: _train()')
-        training_dataset = TwitterDataset('dataset/training.1600000.processed.noemoticon.csv', columns=['sentiment', 'text'])
-        training_dataset.load()
-        testing_dataset = TwitterDataset('dataset/testdata.manual.2009.06.14.csv', columns=['sentiment', 'text'])
-        testing_dataset.load()
-
-        log.info(training_dataset.df)
+    def train(self, training_dataset, testing_dataset, classifier_path):
+        t0 = time.time()
+        log.info('Sentiment: train()')
 
         x_train, y_train = training_dataset.df.text.values.astype('U'), training_dataset.df.sentiment
         x_test, y_test = testing_dataset.df.text.values.astype('U'), testing_dataset.df.sentiment
@@ -217,6 +230,8 @@ class Sentiment(object):
 
         estimators = [
             ('pipe1', LogisticRegression()),
+            ('pipe2', MultinomialNB()),
+            ('pipe3', LinearSVC()),
         ]
 
         pipeline = Pipeline(
@@ -230,21 +245,13 @@ class Sentiment(object):
 
         self._classifier = pipeline
 
-        dump_class(pipeline, 'voting_classifier.pickle')
+        dump_class(pipeline, classifier_path)
 
-    def prepare(self):
-        log.info('Sentiment: prepare()')
-        # for clf_name, params in self._models.items():
-        #     if not os.path.exists(params['file']):
-        #         self._train()
-        #     estimator = Estimator.load_from_file(clf_name, params['file'])
-        #     self._estimators.append((clf_name, estimator))
-        filepath = 'voting_classifier.pickle'
-        if os.path.exists(filepath):
-            self._classifier = load_class(filepath)
-        else:
-            self._train()
+        log.info('Sentiment: train() : time spent: %s', time.time() - t0)
 
+    def load(self, classifier_path):
+        log.info('Sentiment: load()')
+        self._classifier = load_class(classifier_path)
 
     def get_sentiment(self, text):
         log.info('Sentiment: get_sentiment()')
@@ -255,27 +262,77 @@ class Sentiment(object):
         sentiment = self._classifier.predict(x_pred['text'])
         return sentiment
 
-if __name__ == '__main__':
+
+def clean_and_save_dataset(filepath):
+    t0 = time.time()
+    log.info('Cleanup : %s', filepath)
+    cols = ['sentiment','id','date','query_string','user','text']
+    dataset = TwitterDataset(filepath, columns=cols, encoding='latin1')
+    dataset.load()
+    dataset.drop_columns(['id','date','query_string','user'])
+    dataset.cleanup()
+    dataset.drop_null_entries()
+    dataset.df = dataset.df[dataset.df.sentiment != 2]
+    log.info(dataset.df)
+    destfile = os.path.basename(filepath)
+    destpath = os.path.dirname(filepath)
+    destfilepath = os.path.join(destpath, 'preprocessed_' + destfile)
+    log.info('Save : %s', destfilepath)
+    dataset.save(destfilepath)
+    log.info('clean_and_save_dataset: time spent: %s', time.time() - t0)
+
+def train_classifier(classifier_path):
+    log.info('Training classifier')
+    # dataset_dir = 'dataset'
+    # training_dataset_file = 'training.1600000.processed.noemoticon.csv'
+    # testing_dataset_file = 'testdata.manual.2009.06.14.csv'
+
+    # log.info('Cleanup Training Dataset...')
+    # clean_and_save_dataset(os.path.join(dataset_dir, training_dataset_file))
+    # log.info('Cleanup Testing Dataset...')
+    # clean_and_save_dataset(os.path.join(dataset_dir, testing_dataset_file))
+
+    dataset_dir = 'dataset'
+    training_dataset_file = 'preprocessed_training.1600000.processed.noemoticon.csv'
+    testing_dataset_file = 'preprocessed_testdata.manual.2009.06.14.csv'
+
+    training_dataset = TwitterDataset(os.path.join(dataset_dir, training_dataset_file), columns=['sentiment', 'text'])
+    training_dataset.load()
+
+    testing_dataset = TwitterDataset(os.path.join(dataset_dir, testing_dataset_file), columns=['sentiment', 'text'])
+    testing_dataset.load()
+
+    sentiment = Sentiment()
+    sentiment.train(training_dataset, testing_dataset, classifier_path)
+
+def _init_logging():
     console = logging.StreamHandler()
     log.addHandler(console)
     log.setLevel(logging.DEBUG)
 
-    # cols = ['sentiment','id','date','query_string','user','text']
-    # dataset = TwitterDataset('dataset/trainingandtestdata/testdata.manual.2009.06.14.csv', columns=cols, encoding='latin1')
-    # dataset.load()
-    # dataset.drop_columns(['id','date','query_string','user'])
-    # dataset.cleanup()
-    # dataset.drop_null_entries()
-    # dataset.df = dataset.df[dataset.df.sentiment != 2]
-    # log.info(dataset.df)
-    # dataset.save('dataset/testdata.manual.2009.06.14.csv')
+if __name__ == '__main__':
+    _init_logging()
 
-    analyzer = Sentiment()
-    analyzer.prepare()
+    classifier_path = 'sentiment_classifier.pickle'
+    # train_classifier(classifier_path)
+
     data = [
-        'This is a great movie',
-        'worst movie evet watched'
+        ('So there is no way for me to plug it in here in the US unless I go by a converter.', 0),
+        ('Good case, Excellent value.',4),
+        ('Great for the jawbone.',4),
+        ('Tied to charger for conversations lasting more than 45 minutes.MAJOR PROBLEMS!!',0),
+        ('The mic is great.',4),
+        ('I have to jiggle the plug to get it to line up right to get decent volume.',0),
+        ('If you have several dozen or several hundred contacts, then imagine the fun of sending each of them one by one.',0),
+        ('If you are Razr owner...you must have this!',4),
+        ('Needless to say, I wasted my money.',0),
+        ('What a waste of money and time!.',0),
     ]
-    log.info('sentiment: %s', analyzer.get_sentiment(data))
-    # log.info('sentiment: %s', analyzer.get_sentiment('this is very good movie'))
-    # log.info('sentiment: %s', analyzer.get_sentiment('this is very bad movie'))
+
+
+    sentiment = Sentiment()
+    sentiment.load(classifier_path)
+    prediction = sentiment.get_sentiment( [ text for (text, _) in data ] )
+
+    log.info('sentiment: %s', prediction)
+
