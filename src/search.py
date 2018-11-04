@@ -6,6 +6,14 @@ import argparse
 
 log = logging.getLogger(__name__)
 
+class Search(object):
+    def __init__(self, auth_file):
+        self.twitter = twitter.Twitter(auth_file)
+        self.twitter.connect()
+
+    def query(self, text):
+        return self.twitter.search(text)
+
 def received_tweet(tweet):
     text, loc = tweet
     print(text)

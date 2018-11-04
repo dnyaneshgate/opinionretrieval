@@ -134,9 +134,12 @@ class Twitter(IPlatform):
         return result
 
     def _process_tweet(self, tweet):
+        # pp.pprint(tweet)
         text = self._get_text(tweet)
-        loc = self._get_loc(tweet)
-        return (text, loc)
+        user = self._get_user(tweet)
+        # loc = self._get_loc(tweet)
+        # return (text, loc)
+        return (user, text)
 
     def _get_text(self, tweet_dict):
         try:
@@ -157,6 +160,11 @@ class Twitter(IPlatform):
             log.traceback(e)
             raise
         return text
+
+    def _get_user(self, tweet):
+        user = tweet['user']
+        ret = user['name'] + ' ' + user['created_at']
+        return ret
 
     def _get_loc(self, tweet):
         if tweet['coordinates']:
